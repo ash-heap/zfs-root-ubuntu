@@ -4,6 +4,11 @@
 # disk or mirrored configurations are currently supported (multiple VDEV's are
 # not currently supported).  MBR booting is not supported, the system must boot
 # in UEFI mode.
+#
+# This is heavily based on:
+# https://github.com/zfsonlinux/zfs/wiki/Ubuntu-18.04-Root-on-ZFS
+# https://github.com/zfsonlinux/pkg-zfs/wiki/HOWTO-install-Ubuntu-18.04-to-a-Whole-Disk-Native-ZFS-Root-Filesystem-using-Ubiquity-GUI-installer
+
 
 # Version (change these to support different versions)
 VERSION=18.04
@@ -57,9 +62,17 @@ function cmd {
 
 
 function append {
-    echo "echo -e \"$1\" > \"$2\"" >>"$LOGFILE"
+    echo "echo -e \"$1\" >> \"$2\"" >>"$LOGFILE"
     if [[ "$DEBUG" -eq 0 ]]; then
         echo -e "$1" >> "$2"
+    fi
+}
+
+
+function overwrite {
+    echo "echo -e \"$1\" > \"$2\"" >>"$LOGFILE"
+    if [[ "$DEBUG" -eq 0 ]]; then
+        echo -e "$1" > "$2"
     fi
 }
 
@@ -87,10 +100,11 @@ function cancel {
 
 
 function init {
-    info "Installing dependencies..."
     cmd apt-add-repository universe
     cmd apt update
-    cmd apt install --yes gdisk zfs-initramfs mdadm dialog dosfstools grub-pc
+    cmd apt install --yes dialog
+    info "Installing dependencies..."
+    cmd apt install --yes gdisk zfs-initramfs mdadm vim dosfstools grub-pc
 }
 
 
@@ -100,16 +114,61 @@ function get_install_type() {
         --title "Installation Type" \
         --backtitle "$BACKTITLE" \
         --menu "$msg" \
-        17 70 3 \
-        "minimal" "A minimal command line install." \
+        9 70 2 \
+        "desktop" "Desktop installation with GNOME Shell." \
         "server" "Server installation." \
-        "desktop" "Desktop installation using GNOME Shell" \
         2>"$RESULTS"
     EXIT=$?
     if [[ "$EXIT" -ne 0 ]]; then
         cancel
     fi
     TYPE="$(<"$RESULTS")"
+}
+
+
+function list_ethernets() {
+    ip link | awk -F: '$2 ~ "en"{print $2}' | awk '{$1=$1};1'
+}
+
+
+function get_network() {
+    if [[ "$TYPE" != "desktop" ]]; then
+        local ethernets=()
+        for eth in $(list_ethernets); do
+            id=$(disk_id "$sdx")
+            ethernets+=("$eth")
+            ethernets+=("$eth")
+        done
+        msg="Because this is a '$TYPE' installation, NetworkManager will not "
+        msg+="manage the interfaces.  Select an interface to be initialized "
+        msg+="with DHCP (can be changed after install by editing "
+        msg+="'/etc/netplan/01-netcdf.yaml'):"
+        dialog \
+            --title "Select Root Drives" \
+            --backtitle "$BACKTITLE" \
+            --notags \
+            --menu "$msg" \
+            $((10+${#ethernets[@]}/2)) 70 $((${#ethernets[@]}/2)) "${ethernets[@]}" \
+            2>"$RESULTS"
+        EXIT=$?
+        if [[ "$EXIT" -ne 0 ]]; then
+            cancel
+        fi
+        local eth
+        eth="$(<"$RESULTS")"
+        cat << EOF > 01-netcdf.yaml
+# This file describes the network interfaces available on your system
+# For more information, see netplan(5).
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    $eth:
+      dhcp4: yes
+      dhcp6: yes
+
+EOF
+    fi
 }
 
 
@@ -337,13 +396,13 @@ function prepare_disk() {
 function create_rpool() {
     if [[ "${#DISKS[@]}" -eq 1 ]]; then
         local sdx=${DISKS[0]}
+        local size
         local id
         id=$(disk_id "$sdx")
-        local size
         size=$(disk_size "$sdx")
         msg="WARNING: All data will be lost on disk:\\n\\n"
         msg+="    "
-        msg+=$(printf "%3s  %6s  %s" "$sdx" "$(disk_size "$sdx")" "$id")
+        msg+=$(printf "%3s  %6s  %s" "$sdx" "$size" "$id")
         msg+="\\n\\n"
         msg+="WARNING: Single disk layouts do not have any redundancy "
         msg+="against disk failures or file corruption.\\n\\n"
@@ -409,11 +468,18 @@ function create_filesystems() {
     info "Creating filesystems..."
 
     # / and root
-    cmd zfs create -o canmount=off -o mountpoint=none "$RPOOL"/ROOT
-    cmd zfs create -o canmount=noauto -o mountpoint=/ "$RPOOL"/ROOT/ubuntu
-    cmd zfs mount "$RPOOL"/ROOT/ubuntu
-    cmd zfs create -o setuid=off "$RPOOL"/home
-    cmd zfs create -o mountpoint=/root "$RPOOL"/home/root
+    cmd zfs create -o canmount=off -o mountpoint=none "$RPOOL/ROOT"
+    cmd zfs create -o canmount=noauto -o mountpoint=/ "$RPOOL/ROOT/ubuntu"
+    cmd zfs mount "$RPOOL/ROOT/ubuntu"
+    cmd zfs create -o setuid=off "$RPOOL/home"
+    cmd zfs create -o mountpoint=/root "$RPOOL/home/root"
+
+    # first user home
+    cmd zfs create "$RPOOL/home/$USERNAME"
+    cmd zfs create -o com.sun:auto-snapshot=false "$RPOOL/home/$USERNAME/.cache"
+    cmd zfs create -o com.sun:auto-snapshot=false "$RPOOL/home/$USERNAME/Downloads"
+    cmd zfs create -o com.sun:auto-snapshot=false "$RPOOL/home/$USERNAME/Scratch"
+    cmd chown -R 1000:1000 "/mnt/home/$USERNAME"
 
     # var
     cmd zfs create -o canmount=off -o setuid=off -o exec=off "$RPOOL"/var
@@ -439,21 +505,20 @@ function create_filesystems() {
                 cmd zfs create -o exec=on "$RPOOL/games"
                 ;;
             mongodb)
-                cmd zfs create -o canmount=off "$RPOOL/var/lib"
-                cmd zfs create "$RPOOL/var/mongodb"
+                cmd zfs create -o mountpoint=/var/lib/mongodb \
+                    "$RPOOL/var/mongodb"
                 ;;
             mysql)
-                cmd zfs create -o canmount=off "$RPOOL/var/lib"
-                cmd zfs create "$RPOOL/var/mysql"
+                cmd zfs create -o mountpoint=/var/lib/mysql \
+                    "$RPOOL/var/mysql"
                 ;;
             postgres)
-                cmd zfs create -o canmount=off "$RPOOL/var/lib"
-                cmd zfs create "$RPOOL/var/postgres"
+                cmd zfs create -o mountpoint=/var/lib/postgres \
+                    "$RPOOL/var/postgres"
                 ;;
             nfs)
-                cmd zfs create -o canmount=off "$RPOOL/var/lib"
-                cmd zfs create -o com.sun:auto-snapshot=false -o \
-                    "$RPOOL"/var/nfs
+                cmd zfs create -o mountpoint=/var/nfs \
+                    -o com.sun:auto-snapshot=false -o "$RPOOL"/var/nfs
                 ;;
             mail)
                 cmd zfs create "$RPOOL/var/mail"
@@ -467,8 +532,8 @@ function create_filesystems() {
         id=$(disk_id "$sdx")
         cmd mkdosfs -F 32 -n EFI "$id-part3"
     done
-    cmd mkdir /mnt/boot
-    cmd mount "$(disk_id "${DISKS[0]}")" /mnt/boot
+    cmd mkdir -p /mnt/boot/efi
+    cmd mount "$(disk_id "${DISKS[0]}")-part3" /mnt/boot/efi
 
     # ubiquity install target
     cmd zfs create -V 10G "$RPOOL/target"
@@ -486,7 +551,8 @@ function create_filesystems() {
 
 function run_installer() {
     msg="The next step will launch the Ubiquity installer to install Ubuntu "
-    msg+="to a temporary ZVOL.  You must follow the steps below:\\n\\n"
+    msg+="to a temporary ZVOL.  You must follow the steps below, which may "
+    msg+="not be visible once you select 'Launch Ubiquity'.\\n\\n"
     msg+="1. Select any options you like until you get to 'Installation \\n"
     msg+="   Type'.\\n\\n"
     msg+="2. Choose 'Erase disk and install Ubuntu'.\\n\\n"
@@ -525,31 +591,21 @@ function run_installer() {
 
 function copy_installation() {
     info "Copying installation to ZFS filesystems..."
-    if [[ "$DEBUG" -eq 1 ]]; then
-        cmd rsync -avX /target/. /mnt/.
-        for i in {1..100}; do
-            sleep 0.1
-            echo $i
-        done | dialog \
-        --title "Installing" \
-        --backtitle "$BACKTITLE"  \
-        --gauge "Copying installation to ZFS filesystems..." 7 70
-    else
-        local total=$(($(rsync -avXn /target/. /mnt/. | wc -l) - 3))
-        echo "rsync -avX /target/. /mnt/." >> "$LOGFILE"
-        local n=0
-        cmd rsync -avX /target/. /mnt/.
-    fi
+    cmd rsync -avX /target/. /mnt/.
+    append "RESUME=none" /etc/initramfs-tools/conf.d/resume
 }
 
 
-function build_fstab() {
+function install_fstab() {
+    local fstab
     local efi_uuid
+    fstab="/mnt/etc/fstab"
     efi_uuid=$(blkid -s PARTUUID -o value "$(disk_id "${DISKS[0]}")-part3")
     if [[ "$DEBUG" -eq 1 ]]; then
+        fstab="./fstab"
         efi_uuid="EFI_UUID"
     fi
-    cat << EOF > /mnt/etc/fstab
+    cat << EOF > "$fstab"
 # /etc/fstab: static fiel system information.
 #
 # Use 'blkid' to prin the universally unique identifer for a
@@ -560,7 +616,7 @@ function build_fstab() {
 
 $efi_uuid  /boot/efi  vfat nofaile,x-systemd.device-timeout=1  0  1
 
-# Legacy mount /var/log and /var/tmp to avoid race coditions with systemd.
+# Legacy mounts to avoid race conditions between ZFS and systemd.
 $RPOOL/var/log  /var/log  zfs  defaults  0  0
 $RPOOL/var/tmp  /var/tmp  zfs  defaults  0  0
 
@@ -569,10 +625,110 @@ EOF
 }
 
 
+function install_netcfg() {
+    cmd cp 01-netcfg.yaml /mnt/etc/netplan/
+}
+
+
+function convert_desktop_to_server() {
+    if [[ ("$TYPE" == "server") && ($DEBUG -eq 0) ]]; then
+        info "Converting desktop installation to server installation..."
+        cat << EOF | chroot /mnt
+apt update
+apt purge --yes ubuntu-desktop
+apt autoremove --yes
+apt install --yes ubuntu-server
+EOF
+    fi
+}
+
+
+function install_zfs_initramfs() {
+    info "Installing ZFS initramfs..."
+    if [[ ($DEBUG -eq 0) ]]; then
+        cat << EOF | chroot /mnt
+apt-add-repository universe
+apt update
+apt install --yes zfs-initramfs
+EOF
+    fi
+}
+
+
+function install_grub() {
+    info "Installing GRUB bootloader..."
+    if [[ ($DEBUG -eq 0) ]]; then
+        cat << EOF | chroot /mnt
+apt update
+apt install --yes grub-efi-amd64
+grub-install --target=x86_64-efi --efi-directory=/boot/efi \
+    --bootloader-id=ubuntu --recheck --no-floppy
+EOF
+    fi
+}
+
+
+function chroot() {
+    info "Chrooting into installation for final configuration..."
+    cmd mount --rbind /dev  "$1/dev"
+    cmd mount --rbind /proc "$1/proc"
+    cmd mount --rbind /sys  "$1/sys"
+    append "nameserver 8.8.8.8" "$1/etc/resolv.conf"
+    convert_desktop_to_server
+    install_zfs_initramfs
+    install_grub
+}
+
+
+function clone_efi() {
+    if [[ "${#DISKS[@]}" -gt 1 ]]; then
+        info "Cloning EFI parition to each drive..."
+        local i=1
+        cmd umount /mnt/boot/efi
+        for disk in "${DISKS[@]:1}"; do
+            cmd dd if="$(disk_id "${DISKS[0]}")-part3" \
+                of="$(disk_id "$disk")-part3"
+            cmd efibootmgr -c -g -d "$(disk_id "${DISKS[0]}")" \
+                -p 3 -L "ubuntu-$i" -l '\EFI/Ubuntu\grubx64.efi'
+            i=$((i+1))
+        done
+        cmd mount "$(disk_id "${DISKS[0]}")-part3" /mnt/boot/efi
+    fi
+}
+
+
+function finalize() {
+    msg="Make any other customizations to the system at '/mnt' in another "
+    msg+="terminal before selecting 'Continue'.\\n\\n"
+    dialog \
+        --title "Customizations" \
+        --backtitle "$BACKTITLE"  \
+        --ok-label "Continue" \
+        --msgbox "$msg" 6 70
+    EXIT=$?
+    cmd zfs snapshot "$RPOOL/ROOT/ubuntu@install"
+    cmd umount -R /mnt
+    cmd swapoff -a
+    cmd umount /target
+    cmd zpool export "$RPOOL"
+    msg="Do you want to reboot into your new installation now?\\n\\n"
+    dialog \
+        --title "Swap File" \
+        --backtitle "$BACKTITLE"  \
+        --yesno "$msg" 5 70
+    EXIT=$?
+    if [[ "$EXIT" -eq 0 ]]; then
+        cmd reboot
+        return 0
+    else
+        return 0
+    fi
+}
 
 
 init
 get_install_type
+get_network
 get_username
 get_rpool_name
 get_filesystems
@@ -582,3 +738,8 @@ create_rpool
 create_filesystems
 run_installer
 copy_installation
+install_fstab
+install_netcfg
+chroot
+clone_efi
+finalize
