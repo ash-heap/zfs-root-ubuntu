@@ -21,6 +21,7 @@ RPOOL="rpool"
 FILESYSTEMS=()
 SWAP=""
 DISKS=()
+TYPE=desktop
 
 CHANGES=0
 RESULTS="$(mktemp)"
@@ -90,6 +91,25 @@ function init {
     cmd apt-add-repository universe
     cmd apt update
     cmd apt install --yes gdisk zfs-initramfs mdadm dialog dosfstools grub-pc
+}
+
+
+function get_install_type() {
+    msg="Select "
+    dialog \
+        --title "Installation Type" \
+        --backtitle "$BACKTITLE" \
+        --menu "$msg" \
+        17 70 3 \
+        "minimal" "A minimal command line install." \
+        "server" "Server installation." \
+        "desktop" "Desktop installation using GNOME Shell" \
+        2>"$RESULTS"
+    EXIT=$?
+    if [[ "$EXIT" -ne 0 ]]; then
+        cancel
+    fi
+    TYPE="$(<"$RESULTS")"
 }
 
 
@@ -204,15 +224,16 @@ function get_ram() {
 
 function recomended_swap() {
     # based on https://askubuntu.com/a/49138
-    local mem=$(get_ram)
+    local mem
+    mem=$(get_ram)
     if [[ "$mem" -le 2024 ]]; then
-        echo "$(($mem*2))M"
+        echo "$((mem*2))M"
     elif [[ "$mem" -le 8192 ]]; then
-        echo "$(($mem/1024))G"
+        echo "$((mem/1024))G"
     elif [[ "$mem" -le 16384 ]]; then
         echo "8G"
     else
-        echo "$(($mem/2/1024))G"
+        echo "$((mem/2/1024))G"
     fi
 }
 
@@ -316,8 +337,10 @@ function prepare_disk() {
 function create_rpool() {
     if [[ "${#DISKS[@]}" -eq 1 ]]; then
         local sdx=${DISKS[0]}
-        local id=$(disk_id "$sdx")
-        local size=$(disk_size "$sdx")
+        local id
+        id=$(disk_id "$sdx")
+        local size
+        size=$(disk_size "$sdx")
         msg="WARNING: All data will be lost on disk:\\n\\n"
         msg+="    "
         msg+=$(printf "%3s  %6s  %s" "$sdx" "$(disk_size "$sdx")" "$id")
@@ -346,8 +369,8 @@ function create_rpool() {
     else
         msg="WARNING: All data will be lost on disks:\\n\\n"
         for sdx in "${DISKS[@]}"; do
-            local id=$(disk_id "$sdx")
-            local size=$(disk_size "$sdx")
+            local id
+            id=$(disk_id "$sdx")
             msg+="    "
             msg+=$(printf "%3s  %6s  %s" "$sdx" "$(disk_size "$sdx")" "$id")
             msg+="\\n"
@@ -364,7 +387,8 @@ function create_rpool() {
             info "Partitioning drives..."
             local partitions=()
             for disk in "${DISKS[@]}"; do
-                local id=$(disk_id "$sdx")
+                local id
+                id=$(disk_id "$sdx")
                 prepare_disk "$id"
                 partitions+=("$id""-part1")
             done
@@ -396,7 +420,7 @@ function create_filesystems() {
     cmd zfs create -o com.sun:auto-snapshot=false "$RPOOL"/var/cache
     cmd zfs create -o acltype=posixacl -o xattr=sa "$RPOOL"/var/log
     cmd zfs create -o com.sun:auto-snapshot=false "$RPOOL"/var/spool
-    cmd zfs create -o com.sun:auto-snapshot=false "$RPOOL"/var/tmp
+    cmd zfs create -o com.sun:auto-snapshot=false exec=on "$RPOOL"/var/tmp
 
     # optional filesystems
     for option in "${FILESYSTEMS[@]}"; do
@@ -415,20 +439,21 @@ function create_filesystems() {
                 cmd zfs create -o exec=on "$RPOOL/games"
                 ;;
             mongodb)
-                cmd zfs create -o mountpoint=/var/lib/mongodb \
-                    "$RPOOL"/var/mongodb
+                cmd zfs create -o canmount=off "$RPOOL/var/lib"
+                cmd zfs create "$RPOOL/var/mongodb"
                 ;;
             mysql)
-                cmd zfs create -o mountpoint=/var/lib/mysql \
-                    "$RPOOL"/var/mysql
+                cmd zfs create -o canmount=off "$RPOOL/var/lib"
+                cmd zfs create "$RPOOL/var/mysql"
                 ;;
             postgres)
-                cmd zfs create -o mountpoint=/var/lib/postgres \
-                    "$RPOOL"/var/postgres
+                cmd zfs create -o canmount=off "$RPOOL/var/lib"
+                cmd zfs create "$RPOOL/var/postgres"
                 ;;
             nfs)
+                cmd zfs create -o canmount=off "$RPOOL/var/lib"
                 cmd zfs create -o com.sun:auto-snapshot=false -o \
-                    mountpoint=/var/lib/nfs "$RPOOL"/var/nfs
+                    "$RPOOL"/var/nfs
                 ;;
             mail)
                 cmd zfs create "$RPOOL/var/mail"
@@ -438,7 +463,8 @@ function create_filesystems() {
 
     # EFI partition(s)
     for sdx in "${DISKS[@]}"; do
-        local id=$(disk_id "$sdx")
+        local id
+        id=$(disk_id "$sdx")
         cmd mkdosfs -F 32 -n EFI "$id-part3"
         # local partuuid=$(blkid -s PARTUUID -o value "$id-part3")
         # local fstab="$(partuuid)    /boot/efi    vfat    "
@@ -453,7 +479,7 @@ function create_filesystems() {
 
     # swap space
     if [[ "$SWAP" != "" ]]; then
-        cmd zfs create -V 4G -b $(getconf PAGESIZE) -o compression=zle \
+        cmd zfs create -V 4G -b "$(getconf PAGESIZE)" -o compression=zle \
             -o logbias=throughput -o sync=always \
             -o primarycache=metadata -o secondarycache=none \
             -o com.sun:auto-snapshot=false "$RPOOL/swap"
@@ -468,7 +494,8 @@ function run_installer() {
     msg+="1. Select any options you like until you get to 'Installation \\n"
     msg+="   Type'.\\n\\n"
     msg+="2. Choose 'Erase disk and install Ubuntu'.\\n\\n"
-    local disk=$(readlink -f /dev/zvol/$RPOOL/target)
+    local disk
+    disk=$(readlink -f "/dev/zvol/$RPOOL/target")
     msg+="3. Select '$disk' as the installation disk.\\n\\n"
     msg+="4. Continue selecting any options you like until you get to \\n"
     msg+="   'Who are you?'\\n\\n"
@@ -512,10 +539,10 @@ function copy_installation() {
         --backtitle "$BACKTITLE"  \
         --gauge "Copying installation to ZFS filesystems..." 7 70
     else
-        local=total$(($(rsync -avXn /target/. /mnt/. | wc -l) - 3))
+        local total=$(($(rsync -avXn /target/. /mnt/. | wc -l) - 3))
         echo "rsync -avX /target/. /mnt/." > "$LOGFILE"
         local n=0
-        rsync -avX /target/. /mnt/. | tee -a "$LOGFILE" | while read TMP; do
+        rsync -avX /target/. /mnt/. | tee -a "$LOGFILE" | while read -r TMP; do
             n=$((n+1))
             echo "$((n*100/total))"
         done | dialog \
@@ -538,38 +565,17 @@ function ubuntu_chroot() {
     cmd umount -R "$1/dev"
     cmd umount -R "$1/proc"
     cmd umount -R "$1/sys"
-
-}
-
-
-function get_install_type() {
-    msg="Select "
-    dialog \
-        --title "Installation Type" \
-        --backtitle "$BACKTITLE" \
-        --separate-output \
-        --menu "$msg" \
-        17 70 9 \
-        "minimal" "A minimal " \
-        "server" "/opt" \
-        "desktop" "/var/srv"  \
-        2>"$RESULTS"
-    EXIT=$?
-    if [[ "$EXIT" -ne 0 ]]; then
-        cancel
-    fi
-    mapfile -t FILESYSTEMS < "$RESULTS"
 }
 
 
 init
 get_install_type
-# get_username
-# get_rpool_name
-# get_filesystems
-# get_swap
-# get_rpool_disks
-# create_rpool
-# create_filesystems
-# run_installer
+get_username
+get_rpool_name
+get_filesystems
+get_swap
+get_rpool_disks
+create_rpool
+create_filesystems
+run_installer
 copy_installation
