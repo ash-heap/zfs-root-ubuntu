@@ -16,7 +16,7 @@ LOGFILE=install.log
 rm -f "$LOGFILE"
 
 # Result Variables (and defaults)
-USERNAME="admin"
+USERNAME="localadmin"
 RPOOL="rpool"
 FILESYSTEMS=()
 SWAP=""
@@ -352,7 +352,7 @@ function create_rpool() {
             --title "WARNING: DATA LOSS" \
             --backtitle "$BACKTITLE"  \
             --defaultno \
-            --yesno "$msg" 12 70;
+            --yesno "$msg" 13 70;
         then
             info "Partitioning drive..."
             CHANGES=1
@@ -381,7 +381,7 @@ function create_rpool() {
             --title "WARNING: DATA LOSS" \
             --backtitle "$BACKTITLE"  \
             --defaultno \
-            --yesno "$msg" $((8+${#DISKS[@]})) 70;
+            --yesno "$msg" $((8+2*${#DISKS[@]})) 70;
         then
             CHANGES=1
             info "Partitioning drives..."
@@ -410,8 +410,8 @@ function create_filesystems() {
 
     # / and root
     cmd zfs create -o canmount=off -o mountpoint=none "$RPOOL"/ROOT
-    cmd zfs create -o canmount=noauto -o mountpoint=/ "$RPOOL"/ROOT/ubuntu-1
-    cmd zfs mount "$RPOOL"/ROOT/ubuntu-1
+    cmd zfs create -o canmount=noauto -o mountpoint=/ "$RPOOL"/ROOT/ubuntu
+    cmd zfs mount "$RPOOL"/ROOT/ubuntu
     cmd zfs create -o setuid=off "$RPOOL"/home
     cmd zfs create -o mountpoint=/root "$RPOOL"/home/root
 
@@ -466,10 +466,6 @@ function create_filesystems() {
         local id
         id=$(disk_id "$sdx")
         cmd mkdosfs -F 32 -n EFI "$id-part3"
-        # local partuuid=$(blkid -s PARTUUID -o value "$id-part3")
-        # local fstab="$(partuuid)    /boot/efi    vfat    "
-        # fstab+="nofail,x-systemd.device-timeout=1    0    1"
-        # append "$fstab" /etc/fstab
     done
     cmd mkdir /mnt/boot
     cmd mount "$(disk_id "${DISKS[0]}")" /mnt/boot
@@ -479,7 +475,7 @@ function create_filesystems() {
 
     # swap space
     if [[ "$SWAP" != "" ]]; then
-        cmd zfs create -V 4G -b "$(getconf PAGESIZE)" -o compression=zle \
+        cmd zfs create -V "$SWAP" -b "$(getconf PAGESIZE)" -o compression=zle \
             -o logbias=throughput -o sync=always \
             -o primarycache=metadata -o secondarycache=none \
             -o com.sun:auto-snapshot=false "$RPOOL/swap"
@@ -504,19 +500,19 @@ function run_installer() {
         msg+="5. Type '$RPOOL' into 'Your computer's name:'.\\n\\n"
         i=$((i + 1))
     fi
-    msg+="i. Type '$USERNAME' into 'Pick a username:', \\n"
+    msg+="$i. Type '$USERNAME' into 'Pick a username:', \\n"
     msg+="   remembering that case matters.\\n\\n"
     i=$((i + 1))
-    msg+="i. All other options are up to you.\\n\\n"
+    msg+="$i. All other options are up to you.\\n\\n"
     i=$((i + 1))
-    msg+="i. When a message appears that says 'Installation Complete' choose\\n"
+    msg+="$i. When a message appears that says 'Installation Complete' choose\\n"
     msg+="   'Continue Testing'.\\n"
     dialog \
         --title "Running the Ubiquity Installer" \
         --backtitle "$BACKTITLE"  \
         --yes-label "Launch Ubiquity" \
         --no-label "Cancel" \
-        --yesno "$msg" 20 70
+        --yesno "$msg" 18 70
     EXIT=$?
     if [[ "$EXIT" -eq 0 ]]; then
         cmd "$INSTALLER"
@@ -540,32 +536,39 @@ function copy_installation() {
         --gauge "Copying installation to ZFS filesystems..." 7 70
     else
         local total=$(($(rsync -avXn /target/. /mnt/. | wc -l) - 3))
-        echo "rsync -avX /target/. /mnt/." > "$LOGFILE"
+        echo "rsync -avX /target/. /mnt/." >> "$LOGFILE"
         local n=0
-        rsync -avX /target/. /mnt/. | tee -a "$LOGFILE" | while read -r TMP; do
-            n=$((n+1))
-            echo "$((n*100/total))"
-        done | dialog \
-        --title "Installing" \
-        --backtitle "$BACKTITLE"  \
-        --gauge "Copying installation to ZFS filesystems..." 7 70
+        cmd rsync -avX /target/. /mnt/.
     fi
 }
 
 
-function ubuntu_chroot() {
-    cmd mount --rbind /dev  "$1/dev"
-    cmd mount --make-rslave "$1/dev"
-    cmd mount --rbind /proc "$1/proc"
-    cmd mount --make-rslave "$1/proc"
-    cmd mount --rbind /sys  "$1/sys"
-    cmd mount --make-rslave "$1/sys"
-    append "nameserver 8.8.8.8" "$1/etc/resolv.conf"
-    cmd chroot "$@"
-    cmd umount -R "$1/dev"
-    cmd umount -R "$1/proc"
-    cmd umount -R "$1/sys"
+function build_fstab() {
+    local efi_uuid
+    efi_uuid=$(blkid -s PARTUUID -o value "$(disk_id "${DISKS[0]}")-part3")
+    if [[ "$DEBUG" -eq 1 ]]; then
+        efi_uuid="EFI_UUID"
+    fi
+    cat << EOF > /mnt/etc/fstab
+# /etc/fstab: static fiel system information.
+#
+# Use 'blkid' to prin the universally unique identifer for a
+# device; this may be used with UUID= as a more robust way t o name devices
+# that works even if disks are added and removed. See fstab(5).
+#
+# <file system> <mount point>   <type>  <options>       <dump>  <pass>
+
+$efi_uuid  /boot/efi  vfat nofaile,x-systemd.device-timeout=1  0  1
+
+# Legacy mount /var/log and /var/tmp to avoid race coditions with systemd.
+$RPOOL/var/log  /var/log  zfs  defaults  0  0
+$RPOOL/var/tmp  /var/tmp  zfs  defaults  0  0
+
+/dev/zvol/$RPOOL/swap  none  swap  defaults  0  0
+EOF
 }
+
+
 
 
 init
