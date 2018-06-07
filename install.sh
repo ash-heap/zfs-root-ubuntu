@@ -1,21 +1,35 @@
 #!/bin/bash
 
-# Install Ubuntu 18.04 onto a ZFS ROOT.  Only single disk or mirrored
-# configurations are supported (multiple VDEV's are not supported).  MBR
-# booting is no supported, the system must boot in UEFI mode.
+# Install Ubuntu (and Ubuntu based distributions) onto a ZFS ROOT.  Only single
+# disk or mirrored configurations are currently supported (multiple VDEV's are
+# not currently supported).  MBR booting is not supported, the system must boot
+# in UEFI mode.
 
-DEBUG=1
-LOGFILE=zfs_root.log
+# Version (change these to support different versions)
+VERSION=18.04
+RELEASE=bionic
+INSTALLER="ubiquity --no-bootloader"
 
+# Settings
+DEBUG=1  # 0 to actually run commands, 1 to log commands to zfs_root.log
+LOGFILE=install.log
+rm -f "$LOGFILE"
 
-RESULTS="$(mktemp)"
-BACKTITLE="Installing Ubuntu 18.04 on ZFS ROOT pool..."
-RPOOL="rpool"
-DISKS=()
-FILESYSTEMS=()
+# Result Variables (and defaults)
 USERNAME="admin"
+RPOOL="rpool"
+FILESYSTEMS=()
 SWAP=""
+DISKS=()
+
 CHANGES=0
+RESULTS="$(mktemp)"
+
+
+function release() {
+    lsb_release -a | awk -F: '$1 == "Description"{print $2}' | awk '{$1=$1};1'
+}
+BACKTITLE="Installing $(release) on ZFS ROOT pool..."
 
 
 function finish {
@@ -34,7 +48,7 @@ trap ctrl_c INT
 
 function cmd {
     echo "$@" >>"$LOGFILE"
-    if [ "$DEBUG" -eq 0 ]; then
+    if [[ "$DEBUG" -eq 0 ]]; then
         $(echo "$@") >>"$LOGFILE" 2>&1 
         echo "" >> "$LOGFILE"
     fi
@@ -43,7 +57,7 @@ function cmd {
 
 function append {
     echo "echo -e \"$1\" > \"$2\"" >>"$LOGFILE"
-    if [ "$DEBUG" -eq 0 ]; then
+    if [[ "$DEBUG" -eq 0 ]]; then
         echo -e "$1" >> "$2"
     fi
 }
@@ -53,6 +67,7 @@ function info() {
     dialog \
         --backtitle "$BACKTITLE"  \
         --infobox "$1" 3 70;
+    sleep 2 # ensures the info is displayed long enough for the user to read it
 }
 
 
@@ -83,15 +98,14 @@ function get_username() {
     dialog \
         --title "Username" \
         --backtitle "$BACKTITLE"  \
-        --inputbox "$msg" 11 70 "$USERNAME" 2>"$RESULTS"
+        --inputbox "$msg" 8 70 "$USERNAME" 2>"$RESULTS"
     EXIT=$?
-    if [ "$EXIT" -ne 0 ]; then
+    if [[ "$EXIT" -ne 0 ]]; then
         cancel
     fi
     USERNAME="$(<"$RESULTS")"
-    echo "$RPOOL"
     while [[ ("$USERNAME" == "") || ("$USERNAME" =~ [^a-zA-Z0-9]) ]]; do
-        msg="Usernames must consists only of alphanumeric strings " \
+        msg="Usernames must consists only of alphanumeric strings "
         msg+="without spaces.\\n\\n"
         msg+="Specify username of the first user (UID=1000):"
         dialog \
@@ -99,7 +113,7 @@ function get_username() {
             --backtitle "$BACKTITLE"  \
             --inputbox "$msg" 11 70 "$USERNAME" 2>"$RESULTS"
         EXIT=$?
-        if [ "$EXIT" -ne 0 ]; then
+        if [[ "$EXIT" -ne 0 ]]; then
             cancel
         fi
         USERNAME=$(<"$RESULTS")
@@ -108,8 +122,8 @@ function get_username() {
 
 
 function get_rpool_name() {
-    msg="While \"rpool\" is standard among automated installation's you may
-    whish to use the hostname instead.\\n\\n"
+    msg="While \"rpool\" is standard among automated installation's you may "
+    msg+="whish to use the hostname instead.\\n\\n"
     msg+="Specify the name of the ROOT ZFS pool:"
     dialog \
         --title "ROOT Pool Name" \
@@ -120,9 +134,8 @@ function get_rpool_name() {
         cancel
     fi
     RPOOL="$(<"$RESULTS")"
-    echo "$RPOOL"
     while [[ ("$RPOOL" == "") || ("$RPOOL" =~ [^a-zA-Z0-9]) ]]; do
-        msg="Pool names must consists only of alphanumeric strings " \
+        msg="Pool names must consists only of alphanumeric strings "
         msg+="without spaces.\\n\\n"
         msg+="Specify the name of the ROOT ZFS pool:"
         dialog \
@@ -130,7 +143,7 @@ function get_rpool_name() {
             --backtitle "$BACKTITLE"  \
             --inputbox "$msg" 11 70 "$RPOOL" 2>"$RESULTS"
         EXIT=$?
-        if [ "$EXIT" -ne 0 ]; then
+        if [[ "$EXIT" -ne 0 ]]; then
             cancel
         fi
         RPOOL=$(<"$RESULTS")
@@ -145,7 +158,7 @@ get_filesystems() {
         --backtitle "$BACKTITLE" \
         --separate-output \
         --checklist "$msg" \
-        17 60 9 \
+        17 70 9 \
         "local" "/usr/local" ON \
         "opt" "/opt" ON \
         "srv" "/var/srv" OFF \
@@ -154,13 +167,83 @@ get_filesystems() {
         "mysql" "/var/lib/mysql" OFF \
         "postgres" "/var/lib/postgres" OFF \
         "nfs" "/var/lib/nfs" OFF \
-        "mail" "/var/mail" OFF \
+        "mail" "/var/mail" ON \
         2>"$RESULTS"
     EXIT=$?
-    if [ "$EXIT" -ne 0 ]; then
+    if [[ "$EXIT" -ne 0 ]]; then
         cancel
     fi
     mapfile -t FILESYSTEMS < "$RESULTS"
+}
+
+
+function get_swap() {
+    msg="Do you want a swap partition?\\n\\n"
+    msg+="This will be a a ZVOL on the ROOT pool."
+    dialog \
+        --title "Swap File" \
+        --backtitle "$BACKTITLE"  \
+        --yesno "$msg" 7 70
+    EXIT=$?
+    if [[ "$EXIT" -eq 0 ]]; then
+        get_swap_size
+        return 0
+    elif [[ "$EXIT" -eq 1 ]]; then
+        return 0
+    else
+        cancel
+    fi
+}
+
+
+# print memory in MiB
+function get_ram() {
+    free --mebi | awk '$1 ~ "Mem"{print $2}'
+}
+
+
+function recomended_swap() {
+    # based on https://askubuntu.com/a/49138
+    local mem=$(get_ram)
+    if [[ "$mem" -le 2024 ]]; then
+        echo "$(($mem*2))M"
+    elif [[ "$mem" -le 8192 ]]; then
+        echo "$(($mem/1024))G"
+    elif [[ "$mem" -le 16384 ]]; then
+        echo "8G"
+    else
+        echo "$(($mem/2/1024))G"
+    fi
+}
+
+
+function get_swap_size() {
+    msg="This should be less than the total pool size.  "
+    msg+="The value below is the recommeded swap size.\\n\\n"
+    msg+="Specify desired swap size in mebibytes (M) or gibibytes (G):"
+    dialog \
+        --title "Swap Size" \
+        --backtitle "$BACKTITLE"  \
+        --inputbox "$msg" 11 70 "$(recomended_swap)" 2>"$RESULTS"
+    EXIT=$?
+    if [[ "$EXIT" -ne 0 ]]; then
+        cancel
+    fi
+    SWAP="$(<"$RESULTS")"
+    while ! [[ "$SWAP" =~ ^[1-9][0-9]*[mMgG]$ ]]; do
+        msg="Invalid format!\\n\\n"
+        msg+="This should be less than the total pool size.\\n\\n"
+        msg+="Specify desired swap size in megabytes (M) or gigabytes (G):"
+    dialog \
+        --title "Swap Size" \
+        --backtitle "$BACKTITLE"  \
+        --inputbox "$msg" 12 70 "$SWAP" 2>"$RESULTS"
+        EXIT=$?
+        if [[ "$EXIT" -ne 0 ]]; then
+            cancel
+        fi
+        SWAP=$(<"$RESULTS")
+    done
 }
 
 
@@ -187,32 +270,32 @@ function get_rpool_disks() {
     for sdx in $(list_disks); do
         id=$(disk_id "$sdx")
         DISKS+=("$sdx")
-        DISKS+=("$(printf "%3s  %6s  %s" "$sdx" "$(disk_size "$sdx")" "$id")")
+        DISKS+=("$(printf "%3s  %6s  %s" "$sdx" "$(disk_size "$sdx")" "$(echo "$id" | cut -c1-40)")")
         DISKS+=(OFF)
     done
     msg="Select disks to use for the root pool.  "
-    msg+="Only single disk and mirrored configurations are supported at " \
+    msg+="Only single disk and mirrored configurations are supported at "
     msg+="this time.  ALL DATA on chosen disks will be LOST."
     dialog \
         --title "Select Root Drives" \
         --backtitle "$BACKTITLE" \
         --notags --separate-output \
         --checklist "$msg" \
-        $((8+${#DISKS[@]})) 90 ${#DISKS[@]} "${DISKS[@]}" 2>"$RESULTS"
+        $((5+${#DISKS[@]})) 70 ${#DISKS[@]} "${DISKS[@]}" 2>"$RESULTS"
     EXIT=$?
-    if [ "$EXIT" -ne 0 ]; then
+    if [[ "$EXIT" -ne 0 ]]; then
         cancel
     fi
     mapfile -t DISKS < "$RESULTS"
-    if [ "${#DISKS[@]}" -eq 0 ]; then
+    if [[ "${#DISKS[@]}" -eq 0 ]]; then
         msg="No disks where selected.  "
         msg+="Would you like to cancel the installation?"
         dialog \
             --title "No Drives Selected" \
             --backtitle "$BACKTITLE"  \
-            --yesno "$msg" 7 60
+            --yesno "$msg" 7 70
         EXIT=$?
-        if [ "$EXIT" -eq 1 ]; then
+        if [[ "$EXIT" -eq 1 ]]; then
             get_rpool_disks
             return 0
         else
@@ -231,7 +314,7 @@ function prepare_disk() {
 
 
 function create_rpool() {
-    if [ "${#DISKS[@]}" -eq 1 ]; then
+    if [[ "${#DISKS[@]}" -eq 1 ]]; then
         local sdx=${DISKS[0]}
         local id=$(disk_id "$sdx")
         local size=$(disk_size "$sdx")
@@ -240,7 +323,7 @@ function create_rpool() {
         msg+=$(printf "%3s  %6s  %s" "$sdx" "$(disk_size "$sdx")" "$id")
         msg+="\\n\\n"
         msg+="WARNING: Single disk layouts do not have any redundancy "
-        msg+="against disk failures.\\n\\n"
+        msg+="against disk failures or file corruption.\\n\\n"
         msg+="Do you wish to proceed?"
         if dialog \
             --title "WARNING: DATA LOSS" \
@@ -248,9 +331,11 @@ function create_rpool() {
             --defaultno \
             --yesno "$msg" 12 70;
         then
+            info "Partitioning drive..."
             CHANGES=1
             prepare_disk "$id"
-            cmd sleep 1
+            cmd sleep 5
+            info "Creating ZFS pool..."
             cmd zpool create -f -o ashift=12 \
               -O atime=off -O canmount=off -O compression=lz4 \
               -O normalization=formD -O xattr=sa -O mountpoint=/ -R /mnt \
@@ -301,8 +386,8 @@ function create_filesystems() {
 
     # / and root
     cmd zfs create -o canmount=off -o mountpoint=none "$RPOOL"/ROOT
-    cmd zfs create -o canmount=noauto -o mountpoint=/ "$RPOOL"/ROOT/ubuntu
-    cmd zfs mount "$RPOOL"/ROOT/ubuntu
+    cmd zfs create -o canmount=noauto -o mountpoint=/ "$RPOOL"/ROOT/ubuntu-1
+    cmd zfs mount "$RPOOL"/ROOT/ubuntu-1
     cmd zfs create -o setuid=off "$RPOOL"/home
     cmd zfs create -o mountpoint=/root "$RPOOL"/home/root
 
@@ -364,61 +449,127 @@ function create_filesystems() {
     cmd mount "$(disk_id "${DISKS[0]}")" /mnt/boot
 
     # ubiquity install target
-    cmd zfs create -V 10G "$RPOOL/ubiquity"
+    cmd zfs create -V 10G "$RPOOL/target"
+
+    # swap space
+    if [[ "$SWAP" != "" ]]; then
+        cmd zfs create -V 4G -b $(getconf PAGESIZE) -o compression=zle \
+            -o logbias=throughput -o sync=always \
+            -o primarycache=metadata -o secondarycache=none \
+            -o com.sun:auto-snapshot=false "$RPOOL/swap"
+        cmd mkswap -f "/dev/zvol/$RPOOL/swap"
+    fi
 }
 
 
-function get_swap() {
-    msg="Do you want to a ZVOL for swap?"
+function run_installer() {
+    msg="The next step will launch the Ubiquity installer to install Ubuntu "
+    msg+="to a temporary ZVOL.  You must follow the steps below:\\n\\n"
+    msg+="1. Select any options you like until you get to 'Installation \\n"
+    msg+="   Type'.\\n\\n"
+    msg+="2. Choose 'Erase disk and install Ubuntu'.\\n\\n"
+    local disk=$(readlink -f /dev/zvol/$RPOOL/target)
+    msg+="3. Select '$disk' as the installation disk.\\n\\n"
+    msg+="4. Continue selecting any options you like until you get to \\n"
+    msg+="   'Who are you?'\\n\\n"
+    local i=5
+    if [[ "$RPOOL" != "rpool" ]]; then
+        msg+="5. Type '$RPOOL' into 'Your computer's name:'.\\n\\n"
+        i=$((i + 1))
+    fi
+    msg+="i. Type '$USERNAME' into 'Pick a username:', \\n"
+    msg+="   remembering that case matters.\\n\\n"
+    i=$((i + 1))
+    msg+="i. All other options are up to you.\\n\\n"
+    i=$((i + 1))
+    msg+="i. When a message appears that says 'Installation Complete' choose\\n"
+    msg+="   'Continue Testing'.\\n"
     dialog \
-        --title "Swap File" \
+        --title "Running the Ubiquity Installer" \
         --backtitle "$BACKTITLE"  \
-        --yesno "$msg" 7 60
+        --yes-label "Launch Ubiquity" \
+        --no-label "Cancel" \
+        --yesno "$msg" 20 70
     EXIT=$?
-    if [ "$EXIT" -eq 0 ]; then
-        return 0
-    elif [ "$EXIT" -eq 1 ]; then
-        
+    if [[ "$EXIT" -eq 0 ]]; then
+        cmd "$INSTALLER"
         return 0
     else
         cancel
     fi
 }
 
-# function get_swap_size() {
-#     msg="Specify username of the first user (UID=1000):"
-#     dialog \
-#         --title "Username" \
-#         --backtitle "$BACKTITLE"  \
-#         --inputbox "$msg" 11 70 "$USERNAME" 2>"$RESULTS"
-#     EXIT=$?
-#     if [ "$EXIT" -ne 0 ]; then
-#         cancel
-#     fi
-#     USERNAME="$(<"$RESULTS")"
-#     echo "$RPOOL"
-#     while [[ ("$USERNAME" == "") || ("$USERNAME" =~ [^a-zA-Z0-9]) ]]; do
-#         msg="Usernames must consists only of alphanumeric strings " \
-#         msg+="without spaces.\\n\\n"
-#         msg+="Specify username of the first user (UID=1000):"
-#         dialog \
-#             --title "Username" \
-#             --backtitle "$BACKTITLE"  \
-#             --inputbox "$msg" 11 70 "$USERNAME" 2>"$RESULTS"
-#         EXIT=$?
-#         if [ "$EXIT" -ne 0 ]; then
-#             cancel
-#         fi
-#         USERNAME=$(<"$RESULTS")
-#     done
-# }
+
+function copy_installation() {
+    info "Copying installation to ZFS filesystems..."
+    if [[ "$DEBUG" -eq 1 ]]; then
+        cmd rsync -avX /target/. /mnt/.
+        for i in {1..100}; do
+            sleep 0.1
+            echo $i
+        done | dialog \
+        --title "Installing" \
+        --backtitle "$BACKTITLE"  \
+        --gauge "Copying installation to ZFS filesystems..." 7 70
+    else
+        local=total$(($(rsync -avXn /target/. /mnt/. | wc -l) - 3))
+        echo "rsync -avX /target/. /mnt/." > "$LOGFILE"
+        local n=0
+        rsync -avX /target/. /mnt/. | tee -a "$LOGFILE" | while read TMP; do
+            n=$((n+1))
+            echo "$((n*100/total))"
+        done | dialog \
+        --title "Installing" \
+        --backtitle "$BACKTITLE"  \
+        --gauge "Copying installation to ZFS filesystems..." 7 70
+    fi
+}
+
+
+function ubuntu_chroot() {
+    cmd mount --rbind /dev  "$1/dev"
+    cmd mount --make-rslave "$1/dev"
+    cmd mount --rbind /proc "$1/proc"
+    cmd mount --make-rslave "$1/proc"
+    cmd mount --rbind /sys  "$1/sys"
+    cmd mount --make-rslave "$1/sys"
+    append "nameserver 8.8.8.8" "$1/etc/resolv.conf"
+    cmd chroot "$@"
+    cmd umount -R "$1/dev"
+    cmd umount -R "$1/proc"
+    cmd umount -R "$1/sys"
+
+}
+
+
+function get_install_type() {
+    msg="Select "
+    dialog \
+        --title "Installation Type" \
+        --backtitle "$BACKTITLE" \
+        --separate-output \
+        --menu "$msg" \
+        17 70 9 \
+        "minimal" "A minimal " \
+        "server" "/opt" \
+        "desktop" "/var/srv"  \
+        2>"$RESULTS"
+    EXIT=$?
+    if [[ "$EXIT" -ne 0 ]]; then
+        cancel
+    fi
+    mapfile -t FILESYSTEMS < "$RESULTS"
+}
 
 
 init
-get_swap
-get_username
-get_rpool_name
-get_filesystems
-get_rpool_disks
-create_rpool
-create_filesystems
+get_install_type
+# get_username
+# get_rpool_name
+# get_filesystems
+# get_swap
+# get_rpool_disks
+# create_rpool
+# create_filesystems
+# run_installer
+copy_installation
